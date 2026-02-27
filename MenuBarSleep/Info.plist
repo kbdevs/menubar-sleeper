@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>MenuBarSleep</string>
+    <key>CFBundleIdentifier</key>
+	<string>com.menubar.sleep</string>
+    <key>CFBundleName</key>
+    <string>MenuBarSleep</string>
+    <key>CFBundleDisplayName</key>
+    <string>MenuBarSleep</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>MenuBarSleep needs to run a privileged command to toggle the sleep setting.</string>
+</dict>
+</plist>
