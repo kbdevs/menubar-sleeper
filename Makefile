@@ -15,9 +15,12 @@ $(APP_BUNDLE): $(SRC) $(PLIST)
 	swiftc -O -o $(MACOS_DIR)/$(APP_NAME) $(SRC) \
 		-framework Cocoa
 	@cp $(PLIST) $(CONTENTS)/Info.plist
+	@xattr -cr $(APP_BUNDLE)
+	@codesign --force --deep --sign - $(APP_BUNDLE)
 	@echo "Built $(APP_BUNDLE)"
 
 install: $(APP_BUNDLE)
+	@rm -rf /Applications/$(APP_NAME).app
 	@cp -R $(APP_BUNDLE) /Applications/$(APP_NAME).app
 	@echo "Installed to /Applications/$(APP_NAME).app"
 

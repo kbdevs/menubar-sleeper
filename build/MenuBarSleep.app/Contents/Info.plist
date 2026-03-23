@@ -5,7 +5,7 @@
     <key>CFBundleExecutable</key>
     <string>MenuBarSleep</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.MenuBarSleep</string>
+	<string>com.menubar.sleep</string>
     <key>CFBundleName</key>
     <string>MenuBarSleep</string>
     <key>CFBundleDisplayName</key>
@@ -20,7 +20,7 @@
     <string>11.0</string>
     <key>LSUIElement</key>
     <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>MenuBarSleep needs to run a privileged command to toggle the sleep setting.</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
 </dict>
 </plist>

@@ -22,7 +22,5 @@
     <true/>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>MenuBarSleep needs to run a privileged command to toggle the sleep setting.</string>
 </dict>
 </plist>

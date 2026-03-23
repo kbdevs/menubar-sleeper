@@ -1,71 +1,476 @@
 import Cocoa
+import Darwin
+
+struct ActiveSessionMarker: Decodable {
+    let sessionID: String
+    let pid: Int32
+    let status: String
+    let updatedAt: String?
+}
+
+struct ActiveSession {
+    let sessionID: String
+    let title: String
+    let source: String
+}
+
+struct OpenCodeSessionSummary: Decodable {
+    let id: String
+    let title: String?
+    let directory: String?
+    let time: OpenCodeTimeInfo
+}
+
+struct OpenCodeTimeInfo: Decodable {
+    let created: Int64?
+    let updated: Int64?
+    let completed: Int64?
+}
+
+struct OpenCodeMessageEnvelope: Decodable {
+    let info: OpenCodeMessageInfo
+    let parts: [OpenCodeMessagePart]?
+}
+
+struct OpenCodeMessageInfo: Decodable {
+    let role: String
+    let time: OpenCodeTimeInfo?
+}
+
+struct OpenCodeMessagePart: Decodable {
+    let type: String
+    let state: OpenCodeToolState?
+}
+
+struct OpenCodeToolState: Decodable {
+    let status: String?
+}
+
+enum SleepOverrideMode: String {
+    case auto
+    case on
+    case off
+
+    var title: String {
+        switch self {
+        case .auto:
+            return "Auto"
+        case .on:
+            return "On"
+        case .off:
+            return "Off"
+        }
+    }
+}
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private let apiBaseURL = URL(string: "http://127.0.0.1:4096")!
+    private let maxSessionChecks = 8
+    private let recentSessionWindowMs: Int64 = 6 * 60 * 60 * 1000
+    private let sessionStateDirectory = AppDelegate.makeSessionStateDirectory()
+    private let logFileURL = FileManager.default.temporaryDirectory.appendingPathComponent("MenuBarSleep.log")
+    private let refreshQueue = DispatchQueue(label: "MenuBarSleep.refresh", qos: .utility)
+    private let modeDefaultsKey = "sleepOverrideMode"
+
     private var statusItem: NSStatusItem!
-    private var sleepDisabled = false
+    private var monitorTimer: Timer?
+    private var caffeinateProcess: Process?
+    private var activeSessions: [ActiveSession] = []
+    private var lastLoggedSessionCount = Int.min
+    private var refreshInFlight = false
+    private var overrideMode: SleepOverrideMode = .auto
+
+    private func hasAnotherRunningInstance() -> Bool {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
+            return false
+        }
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .contains { app in
+                app.processIdentifier != currentPID && !app.isTerminated
+            }
+    }
+
+    private static func makeSessionStateDirectory() -> URL {
+        let configHome: URL
+
+        if let xdgConfigHome = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdgConfigHome.isEmpty {
+            configHome = URL(fileURLWithPath: xdgConfigHome)
+        } else {
+            configHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config")
+        }
+
+        return configHome
+            .appendingPathComponent("opencode")
+            .appendingPathComponent("menubarsleep")
+            .appendingPathComponent("active-sessions")
+    }
+
+    private func log(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logFileURL.path) {
+                if let handle = try? FileHandle(forWritingTo: logFileURL) {
+                    defer { try? handle.close() }
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                }
+            } else {
+                try? data.write(to: logFileURL)
+            }
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if hasAnotherRunningInstance() {
+            NSApplication.shared.terminate(nil)
+            return
+        }
+
+        overrideMode = loadOverrideMode()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        log("launch home=\(FileManager.default.homeDirectoryForCurrentUser.path) stateDir=\(sessionStateDirectory.path) mode=\(overrideMode.rawValue)")
+        startMonitoring()
         refreshState()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        monitorTimer?.invalidate()
+        stopPreventingSleep()
     }
 
     // MARK: - State
 
+    private func startMonitoring() {
+        monitorTimer = Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(refreshNow), userInfo: nil, repeats: true)
+        if let monitorTimer {
+            RunLoop.main.add(monitorTimer, forMode: .common)
+        }
+    }
+
     private func refreshState() {
-        checkCurrentState()
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
+
+        refreshQueue.async {
+            let refreshedSessions = self.fetchActiveSessions()
+
+            DispatchQueue.main.async {
+                self.refreshInFlight = false
+                self.activeSessions = refreshedSessions
+
+                if self.activeSessions.count != self.lastLoggedSessionCount {
+                    self.lastLoggedSessionCount = self.activeSessions.count
+                    self.log("activeSessions=\(self.activeSessions.count) ids=\(self.activeSessions.map(\.sessionID).joined(separator: ","))")
+                }
+
+                self.syncSleepPrevention()
+                self.updateStatusItem()
+            }
+        }
+    }
+
+    private func fetchActiveSessions() -> [ActiveSession] {
+        var sessionsByID: [String: ActiveSession] = [:]
+
+        for marker in fetchMarkerSessions() {
+            sessionsByID[marker.sessionID] = ActiveSession(
+                sessionID: marker.sessionID,
+                title: "OpenCode session",
+                source: "plugin"
+            )
+        }
+
+        for session in fetchBusySessionsFromAPI() {
+            sessionsByID[session.sessionID] = session
+        }
+
+        return sessionsByID.values.sorted { $0.sessionID < $1.sessionID }
+    }
+
+    private func fetchMarkerSessions() -> [ActiveSessionMarker] {
+        do {
+            let markerURLs = try FileManager.default.contentsOfDirectory(
+                at: sessionStateDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+
+            var validSessions: [String: ActiveSessionMarker] = [:]
+            var staleMarkerURLs: [URL] = []
+
+            for markerURL in markerURLs where markerURL.pathExtension == "json" {
+                guard let marker = decodeMarker(at: markerURL) else {
+                    staleMarkerURLs.append(markerURL)
+                    log("stale marker decode failed path=\(markerURL.path)")
+                    continue
+                }
+
+                guard isProcessAlive(marker.pid) else {
+                    staleMarkerURLs.append(markerURL)
+                    log("stale marker dead pid session=\(marker.sessionID) pid=\(marker.pid)")
+                    continue
+                }
+
+                validSessions[marker.sessionID] = marker
+            }
+
+            removeStaleMarkers(at: staleMarkerURLs)
+
+            return validSessions.values.sorted { $0.sessionID < $1.sessionID }
+        } catch {
+            log("failed reading state dir error=\(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private func fetchBusySessionsFromAPI() -> [ActiveSession] {
+        guard let sessions: [OpenCodeSessionSummary] = fetchJSON(from: apiBaseURL.appendingPathComponent("session")) else {
+            log("api session fetch failed")
+            return []
+        }
+
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let candidateSessions = sessions
+            .filter { session in
+                let updatedAt = session.time.updated ?? session.time.created ?? 0
+                return nowMs - updatedAt <= recentSessionWindowMs
+            }
+            .sorted { ($0.time.updated ?? 0) > ($1.time.updated ?? 0) }
+            .prefix(maxSessionChecks)
+
+        var busySessions: [ActiveSession] = []
+
+        for session in candidateSessions where isSessionBusy(session.id) {
+            busySessions.append(
+                ActiveSession(
+                    sessionID: session.id,
+                    title: session.title ?? session.directory ?? session.id,
+                    source: "api"
+                )
+            )
+        }
+
+        return busySessions
+    }
+
+    private func isSessionBusy(_ sessionID: String) -> Bool {
+        let messagesURL = apiBaseURL
+            .appendingPathComponent("session")
+            .appendingPathComponent(sessionID)
+            .appendingPathComponent("message")
+
+        guard let messages: [OpenCodeMessageEnvelope] = fetchJSON(from: messagesURL),
+              let latestMessage = messages.last else {
+            return false
+        }
+
+        if latestMessage.info.role == "assistant", latestMessage.info.time?.completed == nil {
+            return true
+        }
+
+        var openStepCount = 0
+
+        for part in latestMessage.parts ?? [] {
+            if part.type == "tool", part.state?.status == "running" {
+                return true
+            }
+
+            if part.type == "step-start" {
+                openStepCount += 1
+            } else if part.type == "step-finish", openStepCount > 0 {
+                openStepCount -= 1
+            }
+        }
+
+        return openStepCount > 0
+    }
+
+    private func fetchJSON<T: Decodable>(from url: URL) -> T? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var responseData: Data?
+
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            responseData = data
+            semaphore.signal()
+        }.resume()
+
+        guard semaphore.wait(timeout: .now() + 3) == .success,
+              let responseData else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(T.self, from: responseData)
+    }
+
+    private func decodeMarker(at url: URL) -> ActiveSessionMarker? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(ActiveSessionMarker.self, from: data)
+    }
+
+    private func removeStaleMarkers(at urls: [URL]) {
+        guard !urls.isEmpty else { return }
+
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func isProcessAlive(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+
+        if kill(pid, 0) == 0 {
+            return true
+        }
+
+        return errno == EPERM
+    }
+
+    private func loadOverrideMode() -> SleepOverrideMode {
+        guard let rawValue = UserDefaults.standard.string(forKey: modeDefaultsKey),
+              let mode = SleepOverrideMode(rawValue: rawValue) else {
+            return .auto
+        }
+
+        return mode
+    }
+
+    private func setOverrideMode(_ mode: SleepOverrideMode) {
+        guard overrideMode != mode else { return }
+
+        overrideMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: modeDefaultsKey)
+        log("override mode=\(mode.rawValue)")
+        syncSleepPrevention()
         updateStatusItem()
     }
 
-    private func checkCurrentState() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        task.arguments = ["-g"]
+    private func shouldPreventSleep() -> Bool {
+        switch overrideMode {
+        case .auto:
+            return !activeSessions.isEmpty
+        case .on:
+            return true
+        case .off:
+            return false
+        }
+    }
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
+    private func syncSleepPrevention() {
+        if shouldPreventSleep() {
+            startPreventingSleep()
+        } else {
+            stopPreventingSleep()
+        }
+    }
+
+    private func startPreventingSleep() {
+        guard !(caffeinateProcess?.isRunning ?? false) else { return }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        process.arguments = ["-dimsu"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
 
         do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                // pmset output has "disablesleep" followed by whitespace and 0 or 1
-                sleepDisabled = output.range(of: #"SleepDisabled\s+1"#, options: .regularExpression) != nil
-            }
+            try process.run()
+            caffeinateProcess = process
+            log("started caffeinate pid=\(process.processIdentifier)")
         } catch {
-            sleepDisabled = false
+            log("failed starting caffeinate error=\(error.localizedDescription)")
+            caffeinateProcess = nil
         }
+    }
+
+    private func stopPreventingSleep() {
+        guard let process = caffeinateProcess else { return }
+
+        if process.isRunning {
+            process.terminate()
+            log("stopped caffeinate pid=\(process.processIdentifier)")
+        }
+
+        caffeinateProcess = nil
     }
 
     // MARK: - UI
 
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
+        let isPreventingSleep = caffeinateProcess?.isRunning ?? false
 
-        // Menu bar icon: coffee cup when caffeinated, moon when sleep enabled
         if #available(macOS 11.0, *) {
-            let symbolName = sleepDisabled ? "cup.and.saucer.fill" : "moon.zzz.fill"
-            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: sleepDisabled ? "Sleep Disabled" : "Sleep Enabled")
+            let symbolName = isPreventingSleep ? "cup.and.saucer.fill" : "moon.zzz.fill"
+            button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: isPreventingSleep ? "Preventing Sleep" : "Sleep Allowed")
+            button.image?.isTemplate = true
         } else {
-            button.title = sleepDisabled ? "Awake" : "Sleep"
+            button.title = isPreventingSleep ? "Awake" : "Sleep"
         }
 
-        // Build the dropdown menu
         let menu = NSMenu()
 
-        let statusText = sleepDisabled ? "Sleep Disabled (Caffeinated)" : "Sleep Enabled"
+        let statusText: String
+        switch overrideMode {
+        case .auto:
+            if activeSessions.isEmpty {
+                statusText = "Auto - Sleep Allowed"
+            } else if isPreventingSleep {
+                let sessionLabel = activeSessions.count == 1 ? "session" : "sessions"
+                statusText = "Auto - Preventing Sleep (\(activeSessions.count) active \(sessionLabel))"
+            } else {
+                statusText = "Auto - Failed to prevent sleep"
+            }
+        case .on:
+            statusText = isPreventingSleep ? "Manual On - Preventing Sleep" : "Manual On - Failed to prevent sleep"
+        case .off:
+            statusText = "Manual Off - Sleep Allowed"
+        }
+
         let statusMenuItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
+        let modeMenuItem = NSMenuItem(title: "Mode: \(overrideMode.title)", action: nil, keyEquivalent: "")
+        modeMenuItem.isEnabled = false
+        menu.addItem(modeMenuItem)
+
+        let countMenuItem = NSMenuItem(title: "Detected active sessions: \(activeSessions.count)", action: nil, keyEquivalent: "")
+        countMenuItem.isEnabled = false
+        menu.addItem(countMenuItem)
+
+        if let firstSession = activeSessions.first {
+            let detailMenuItem = NSMenuItem(title: "Example session: \(firstSession.title) [\(firstSession.source)]", action: nil, keyEquivalent: "")
+            detailMenuItem.isEnabled = false
+            menu.addItem(detailMenuItem)
+        }
+
         menu.addItem(.separator())
 
-        let toggleTitle = sleepDisabled ? "Enable Sleep" : "Disable Sleep"
-        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleSleep), keyEquivalent: "t")
-        toggleItem.target = self
-        menu.addItem(toggleItem)
+        let autoItem = NSMenuItem(title: "Auto", action: #selector(setModeAuto), keyEquivalent: "1")
+        autoItem.target = self
+        autoItem.state = overrideMode == .auto ? .on : .off
+        menu.addItem(autoItem)
+
+        let onItem = NSMenuItem(title: "On", action: #selector(setModeOn), keyEquivalent: "2")
+        onItem.target = self
+        onItem.state = overrideMode == .on ? .on : .off
+        menu.addItem(onItem)
+
+        let offItem = NSMenuItem(title: "Off", action: #selector(setModeOff), keyEquivalent: "3")
+        offItem.target = self
+        offItem.state = overrideMode == .off ? .on : .off
+        menu.addItem(offItem)
+
+        menu.addItem(.separator())
+
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
 
         menu.addItem(.separator())
 
@@ -78,28 +483,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    @objc private func toggleSleep() {
-        let newValue = sleepDisabled ? "0" : "1"
-        let success = runPrivilegedCommand("pmset -a disablesleep \(newValue)")
-        if success {
-            refreshState()
-        }
+    @objc private func refreshNow() {
+        refreshState()
     }
 
-    private func runPrivilegedCommand(_ command: String) -> Bool {
-        let script = "do shell script \"\(command)\" with administrator privileges"
-        var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: script) {
-            appleScript.executeAndReturnError(&error)
-            return error == nil
-        }
-        return false
+    @objc private func setModeAuto() {
+        setOverrideMode(.auto)
+    }
+
+    @objc private func setModeOn() {
+        setOverrideMode(.on)
+    }
+
+    @objc private func setModeOff() {
+        setOverrideMode(.off)
     }
 
     @objc private func quitApp() {
-        if sleepDisabled {
-            _ = runPrivilegedCommand("pmset -a disablesleep 0")
-        }
+        stopPreventingSleep()
         NSApplication.shared.terminate(nil)
     }
 }
@@ -107,7 +508,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Entry point
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // No dock icon, no app menu bar
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
