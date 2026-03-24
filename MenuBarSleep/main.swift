@@ -75,6 +75,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let osascriptURL = URL(fileURLWithPath: "/usr/bin/osascript")
 
     private var statusItem: NSStatusItem!
+    private var statusMenu: NSMenu!
+    private var statusTextItem: NSMenuItem!
+    private var modeTextItem: NSMenuItem!
+    private var countTextItem: NSMenuItem!
+    private var detailTextItem: NSMenuItem!
+    private var autoModeItem: NSMenuItem!
+    private var onModeItem: NSMenuItem!
+    private var offModeItem: NSMenuItem!
     private var monitorTimer: Timer?
     private var activeSessions: [ActiveSession] = []
     private var lastLoggedSessionCount = Int.min
@@ -134,6 +142,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overrideMode = loadOverrideMode()
         disableSleepEnabled = readDisableSleepSetting()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        configureMenu()
         log("launch home=\(FileManager.default.homeDirectoryForCurrentUser.path) stateDir=\(sessionStateDirectory.path) mode=\(overrideMode.rawValue) disablesleep=\(disableSleepEnabled ? 1 : 0)")
         startMonitoring()
         refreshState()
@@ -489,6 +498,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - UI
 
+    private func configureMenu() {
+        statusMenu = NSMenu()
+
+        statusTextItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        statusTextItem.isEnabled = false
+        statusMenu.addItem(statusTextItem)
+
+        modeTextItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        modeTextItem.isEnabled = false
+        statusMenu.addItem(modeTextItem)
+
+        countTextItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        countTextItem.isEnabled = false
+        statusMenu.addItem(countTextItem)
+
+        detailTextItem = NSMenuItem(title: "No active session details", action: nil, keyEquivalent: "")
+        detailTextItem.isEnabled = false
+        statusMenu.addItem(detailTextItem)
+
+        statusMenu.addItem(.separator())
+
+        autoModeItem = NSMenuItem(title: "Auto", action: #selector(setModeAuto), keyEquivalent: "1")
+        autoModeItem.target = self
+        statusMenu.addItem(autoModeItem)
+
+        onModeItem = NSMenuItem(title: "On", action: #selector(setModeOn), keyEquivalent: "2")
+        onModeItem.target = self
+        statusMenu.addItem(onModeItem)
+
+        offModeItem = NSMenuItem(title: "Off", action: #selector(setModeOff), keyEquivalent: "3")
+        offModeItem.target = self
+        statusMenu.addItem(offModeItem)
+
+        statusMenu.addItem(.separator())
+
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
+        refreshItem.target = self
+        statusMenu.addItem(refreshItem)
+
+        statusMenu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        statusMenu.addItem(quitItem)
+
+        statusItem.menu = statusMenu
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
         let isPreventingSleep = disableSleepEnabled
@@ -500,8 +557,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             button.title = isPreventingSleep ? "Awake" : "Sleep"
         }
-
-        let menu = NSMenu()
 
         let statusText: String
         switch overrideMode {
@@ -536,54 +591,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let statusMenuItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
-        statusMenuItem.isEnabled = false
-        menu.addItem(statusMenuItem)
-
-        let modeMenuItem = NSMenuItem(title: "Mode: \(overrideMode.title)", action: nil, keyEquivalent: "")
-        modeMenuItem.isEnabled = false
-        menu.addItem(modeMenuItem)
-
-        let countMenuItem = NSMenuItem(title: "Detected active sessions: \(activeSessions.count)", action: nil, keyEquivalent: "")
-        countMenuItem.isEnabled = false
-        menu.addItem(countMenuItem)
+        statusTextItem.title = statusText
+        modeTextItem.title = "Mode: \(overrideMode.title)"
+        countTextItem.title = "Detected active sessions: \(activeSessions.count)"
 
         if let firstSession = activeSessions.first {
-            let detailMenuItem = NSMenuItem(title: "Example session: \(firstSession.title) [\(firstSession.source)]", action: nil, keyEquivalent: "")
-            detailMenuItem.isEnabled = false
-            menu.addItem(detailMenuItem)
+            detailTextItem.title = "Example session: \(firstSession.title) [\(firstSession.source)]"
+        }
+        else {
+            detailTextItem.title = "No active session details"
         }
 
-        menu.addItem(.separator())
-
-        let autoItem = NSMenuItem(title: "Auto", action: #selector(setModeAuto), keyEquivalent: "1")
-        autoItem.target = self
-        autoItem.state = overrideMode == .auto ? .on : .off
-        menu.addItem(autoItem)
-
-        let onItem = NSMenuItem(title: "On", action: #selector(setModeOn), keyEquivalent: "2")
-        onItem.target = self
-        onItem.state = overrideMode == .on ? .on : .off
-        menu.addItem(onItem)
-
-        let offItem = NSMenuItem(title: "Off", action: #selector(setModeOff), keyEquivalent: "3")
-        offItem.target = self
-        offItem.state = overrideMode == .off ? .on : .off
-        menu.addItem(offItem)
-
-        menu.addItem(.separator())
-
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
+        autoModeItem.state = overrideMode == .auto ? .on : .off
+        onModeItem.state = overrideMode == .on ? .on : .off
+        offModeItem.state = overrideMode == .off ? .on : .off
     }
 
     // MARK: - Actions
