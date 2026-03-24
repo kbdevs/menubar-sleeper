@@ -156,7 +156,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - State
 
     private func startMonitoring() {
-        monitorTimer = Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(refreshNow), userInfo: nil, repeats: true)
+        monitorTimer = Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(timerRefreshNow), userInfo: nil, repeats: true)
         if let monitorTimer {
             RunLoop.main.add(monitorTimer, forMode: .common)
         }
@@ -533,7 +533,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusMenu.addItem(.separator())
 
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(manualRefreshNow), keyEquivalent: "r")
         refreshItem.target = self
         statusMenu.addItem(refreshItem)
 
@@ -609,7 +609,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    @objc private func refreshNow() {
+    @objc private func timerRefreshNow() {
+        disableSleepEnabled = readDisableSleepSetting()
+        refreshState()
+    }
+
+    @objc private func manualRefreshNow() {
         failedDisableSleepTarget = nil
         disableSleepEnabled = readDisableSleepSetting()
         refreshState()
