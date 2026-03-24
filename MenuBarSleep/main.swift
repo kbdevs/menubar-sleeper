@@ -71,8 +71,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let logFileURL = FileManager.default.temporaryDirectory.appendingPathComponent("MenuBarSleep.log")
     private let refreshQueue = DispatchQueue(label: "MenuBarSleep.refresh", qos: .utility)
     private let modeDefaultsKey = "sleepOverrideMode"
-    private let pmsetURL = URL(fileURLWithPath: "/usr/bin/pmset")
-    private let osascriptURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    private let caffeinateURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
 
     private var statusItem: NSStatusItem!
     private var statusMenu: NSMenu!
@@ -84,12 +83,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var onModeItem: NSMenuItem!
     private var offModeItem: NSMenuItem!
     private var monitorTimer: Timer?
+    private var caffeinateProcess: Process?
     private var activeSessions: [ActiveSession] = []
     private var lastLoggedSessionCount = Int.min
     private var refreshInFlight = false
     private var overrideMode: SleepOverrideMode = .auto
-    private var disableSleepEnabled = false
-    private var failedDisableSleepTarget: Bool?
 
     private func hasAnotherRunningInstance() -> Bool {
         guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
@@ -140,11 +138,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         overrideMode = loadOverrideMode()
-        disableSleepEnabled = readDisableSleepSetting()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configureMenu()
-        log("launch home=\(FileManager.default.homeDirectoryForCurrentUser.path) stateDir=\(sessionStateDirectory.path) mode=\(overrideMode.rawValue) disablesleep=\(disableSleepEnabled ? 1 : 0)")
-        startMonitoring()
+        log("launch home=\(FileManager.default.homeDirectoryForCurrentUser.path) stateDir=\(sessionStateDirectory.path) mode=\(overrideMode.rawValue)")
+        if overrideMode != .off {
+            startMonitoring()
+        }
         refreshState()
     }
 
@@ -156,6 +155,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - State
 
     private func startMonitoring() {
+        guard monitorTimer == nil else { return }
         monitorTimer = Timer.scheduledTimer(timeInterval: 3, target: self, selector: #selector(timerRefreshNow), userInfo: nil, repeats: true)
         if let monitorTimer {
             RunLoop.main.add(monitorTimer, forMode: .common)
@@ -163,6 +163,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshState() {
+        if overrideMode == .off {
+            activeSessions = []
+            lastLoggedSessionCount = 0
+            stopPreventingSleep()
+            updateStatusItem()
+            return
+        }
+
         guard !refreshInFlight else { return }
         refreshInFlight = true
 
@@ -341,67 +349,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return try? JSONDecoder().decode(T.self, from: responseData)
     }
 
-    private func runProcess(executableURL: URL, arguments: [String]) -> (status: Int32, stdout: String, stderr: String)? {
-        let process = Process()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            log("failed running process path=\(executableURL.path) error=\(error.localizedDescription)")
-            return nil
-        }
-
-        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (process.terminationStatus, stdout, stderr)
-    }
-
-    private func appleScriptStringLiteral(_ string: String) -> String {
-        let escaped = string
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"\(escaped)\""
-    }
-
-    private func runPrivilegedShellCommand(_ command: String) -> Bool {
-        let script = "do shell script \(appleScriptStringLiteral(command)) with administrator privileges"
-
-        guard let result = runProcess(executableURL: osascriptURL, arguments: ["-e", script]) else {
-            return false
-        }
-
-        guard result.status == 0 else {
-            let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            let stdout = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            log("privileged command failed status=\(result.status) command=\(command) stderr=\(stderr) stdout=\(stdout)")
-            return false
-        }
-
-        return true
-    }
-
-    private func readDisableSleepSetting() -> Bool {
-        guard let result = runProcess(executableURL: pmsetURL, arguments: ["-g", "custom"]), result.status == 0 else {
-            return disableSleepEnabled
-        }
-
-        for line in result.stdout.split(whereSeparator: \.isNewline) {
-            let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count >= 2, fields[0] == "disablesleep" else { continue }
-            return fields.last == "1"
-        }
-
-        return false
-    }
-
     private func decodeMarker(at url: URL) -> ActiveSessionMarker? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(ActiveSessionMarker.self, from: data)
@@ -438,11 +385,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard overrideMode != mode else { return }
 
         overrideMode = mode
-        failedDisableSleepTarget = nil
         UserDefaults.standard.set(mode.rawValue, forKey: modeDefaultsKey)
         log("override mode=\(mode.rawValue)")
+
+        if mode == .off {
+            monitorTimer?.invalidate()
+            monitorTimer = nil
+            activeSessions = []
+        } else {
+            startMonitoring()
+        }
+
         syncSleepPrevention()
         updateStatusItem()
+        if mode != .off {
+            refreshState()
+        }
     }
 
     private func shouldPreventSleep() -> Bool {
@@ -465,35 +423,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startPreventingSleep() {
-        guard !disableSleepEnabled else { return }
-        guard failedDisableSleepTarget != true else { return }
+        guard !(caffeinateProcess?.isRunning ?? false) else { return }
 
-        let command = "/usr/bin/pmset -a disablesleep 1"
-        guard runPrivilegedShellCommand(command) else {
-            failedDisableSleepTarget = true
-            updateStatusItem()
-            return
+        let process = Process()
+        process.executableURL = caffeinateURL
+        process.arguments = ["-dimsu"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            caffeinateProcess = process
+            log("started caffeinate pid=\(process.processIdentifier)")
+        } catch {
+            log("failed starting caffeinate error=\(error.localizedDescription)")
+            caffeinateProcess = nil
         }
-
-        disableSleepEnabled = readDisableSleepSetting()
-        failedDisableSleepTarget = disableSleepEnabled ? nil : true
-        log("set disablesleep=\(disableSleepEnabled ? 1 : 0)")
     }
 
     private func stopPreventingSleep() {
-        guard disableSleepEnabled else { return }
-        guard failedDisableSleepTarget != false else { return }
+        guard let process = caffeinateProcess else { return }
 
-        let command = "/usr/bin/pmset -a disablesleep 0"
-        guard runPrivilegedShellCommand(command) else {
-            failedDisableSleepTarget = false
-            updateStatusItem()
-            return
+        if process.isRunning {
+            process.terminate()
+            log("stopped caffeinate pid=\(process.processIdentifier)")
         }
 
-        disableSleepEnabled = readDisableSleepSetting()
-        failedDisableSleepTarget = disableSleepEnabled ? false : nil
-        log("set disablesleep=\(disableSleepEnabled ? 1 : 0)")
+        caffeinateProcess = nil
     }
 
     // MARK: - UI
@@ -548,7 +504,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
-        let isPreventingSleep = disableSleepEnabled
+        let isPreventingSleep = caffeinateProcess?.isRunning ?? false
 
         if #available(macOS 11.0, *) {
             let symbolName = isPreventingSleep ? "cup.and.saucer.fill" : "moon.zzz.fill"
@@ -562,43 +518,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         switch overrideMode {
         case .auto:
             if activeSessions.isEmpty {
-                if failedDisableSleepTarget == false {
-                    statusText = "Auto - Admin approval needed to re-enable sleep"
-                } else {
-                    statusText = "Auto - Sleep Allowed"
-                }
+                statusText = "Auto - Sleep Allowed"
             } else if isPreventingSleep {
                 let sessionLabel = activeSessions.count == 1 ? "session" : "sessions"
                 statusText = "Auto - Preventing Sleep (\(activeSessions.count) active \(sessionLabel))"
-            } else if failedDisableSleepTarget == true {
-                statusText = "Auto - Admin approval needed to disable sleep"
             } else {
-                statusText = "Auto - Failed to change sleep setting"
+                statusText = "Auto - Failed to prevent sleep"
             }
         case .on:
             if isPreventingSleep {
                 statusText = "Manual On - Preventing Sleep"
-            } else if failedDisableSleepTarget == true {
-                statusText = "Manual On - Admin approval needed"
             } else {
-                statusText = "Manual On - Failed to change sleep setting"
+                statusText = "Manual On - Failed to prevent sleep"
             }
         case .off:
-            if failedDisableSleepTarget == false {
-                statusText = "Manual Off - Admin approval needed"
-            } else {
-                statusText = "Manual Off - Sleep Allowed"
-            }
+            statusText = "Manual Off - Sleep Allowed"
         }
 
         statusTextItem.title = statusText
         modeTextItem.title = "Mode: \(overrideMode.title)"
-        countTextItem.title = "Detected active sessions: \(activeSessions.count)"
+        countTextItem.title = overrideMode == .off ? "Detected active sessions: 0" : "Detected active sessions: \(activeSessions.count)"
 
-        if let firstSession = activeSessions.first {
+        if overrideMode == .off {
+            detailTextItem.title = "Monitoring paused in Off"
+        } else if let firstSession = activeSessions.first {
             detailTextItem.title = "Example session: \(firstSession.title) [\(firstSession.source)]"
-        }
-        else {
+        } else {
             detailTextItem.title = "No active session details"
         }
 
@@ -610,13 +555,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc private func timerRefreshNow() {
-        disableSleepEnabled = readDisableSleepSetting()
+        guard overrideMode != .off else { return }
         refreshState()
     }
 
     @objc private func manualRefreshNow() {
-        failedDisableSleepTarget = nil
-        disableSleepEnabled = readDisableSleepSetting()
+        guard overrideMode != .off else {
+            activeSessions = []
+            updateStatusItem()
+            return
+        }
         refreshState()
     }
 
